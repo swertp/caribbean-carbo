@@ -84,12 +84,13 @@ tr.win td{color:var(--sun);font-weight:700}
 </head>
 <body>
 <div id="app"></div>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.16.0/dist/mqtt.min.js"></script>
+<script>window.mqtt||document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.16.0/dist/mqtt.min.js"><\/script>');</script>
 <script>
 'use strict';
 /* =====================================================================
    CABO online – ein Browser (der Host) ist Spielleiter, die anderen
-   verbinden sich per WebRTC (PeerJS). Verdeckte Karten verlassen den
+   verbinden sich über einen öffentlichen MQTT-Server (Websocket, geht durch Firewalls). Verdeckte Karten verlassen den
    Host nie; jeder Spieler bekommt nur seine eigene Sicht auf das Spiel.
    ===================================================================== */
 const $app=document.getElementById('app');
@@ -97,19 +98,31 @@ const S=sessionStorage;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const rnd=n=>Math.floor(Math.random()*n);
 function shuffle(a){for(let i=a.length-1;i>0;i--){const j=rnd(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;}
-function makeCode(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ';let s='';for(let i=0;i<5;i++)s+=c[rnd(c.length)];return s;}
+function makeCode(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ';let s='A';for(let i=0;i<5;i++)s+=c[rnd(c.length)];return s;}
 function makeToken(){return 'p'+Math.random().toString(36).slice(2,10)+Date.now().toString(36);}
 
 let token=S.getItem('cabo_token'); if(!token){token=makeToken();S.setItem('cabo_token',token);}
-let role=null,myName='',roomCode='',peer=null,conn=null,conns={},G=null,view=null,status='',fatal=false,retryT=null,tt=null,tc=0;
+let role=null,myName='',roomCode='',mq=null,G=null,view=null,status='',fatal=false,retryT=null,tt=null,tc=0,dedup={},sess=Math.random().toString(36).slice(2,8),mseq=0;
 let ui={sel:[],swapOwn:null,peeked:[],temps:{},round:-1,lastFlash:0,toast:''};
 const dbgLog=[];
 function dbg(m){dbgLog.push(new Date().toTimeString().slice(0,8)+' '+m);if(dbgLog.length>8)dbgLog.shift();try{render();}catch(e){}}
 function dbgHTML(){return dbgLog.length?'<div class="dbg">'+dbgLog.map(esc).join('<br>')+'</div>':'';}
-const PEER_OPTS={config:{iceServers:[
-  {urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'},
-  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}
-]}};
+/* Öffentliche MQTT-Broker (Websocket/TLS). Der erste Buchstabe des Raumcodes wählt den Broker: A, B, C. */
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081'];
+const brokerIdx=code=>{const k='ABC'.indexOf((code||'A')[0]);return k>=0?k:0;};
+const topic=(suffix)=>'cabo-fam/v1/'+roomCode+'/'+suffix;
+function mqOpen(will){
+  if(typeof mqtt==='undefined'){dbg('FEHLER: MQTT-Bibliothek konnte nicht geladen werden (Internet/Werbeblocker?)');status='MQTT-Bibliothek nicht geladen';render();return null;}
+  closeMq();
+  const c=mqtt.connect(BROKERS[brokerIdx(roomCode)],{clientId:'cabo_'+Math.random().toString(16).slice(2,12),clean:true,reconnectPeriod:2000,connectTimeout:10000,keepalive:30,will});
+  mq=c;
+  c.on('error',e=>dbg('Fehler: '+(e&&e.message||e)));
+  c.on('offline',()=>dbg('Server nicht erreichbar'));
+  c.on('close',()=>{if(mq===c&&!fatal){status='Verbindung zum Server getrennt – verbinde neu …';render();}});
+  return c;
+}
+function closeMq(){if(mq){const c=mq;mq=null;try{c.removeAllListeners();c.on('error',()=>{});c.end(true);}catch(e){}}}
+function pub(t,obj,retain){if(mq&&mq.connected)try{mq.publish(t,typeof obj==='string'?obj:JSON.stringify(obj),{qos:1,retain:!!retain});}catch(e){}}
 const numColor=v=>`hsl(${172-v*12},72%,${v>9?42:30}%)`;
 const ICON={7:'👁',8:'👁',9:'🔍',10:'🔍',11:'🔄',12:'🔄'};
 const ACT={7:'peek',8:'peek',9:'spy',10:'spy',11:'swap',12:'swap'};
@@ -298,57 +311,68 @@ function viewFor(i){
     log:G.log.slice(-5)
   };
 }
-function safeSend(c,m){try{if(c&&c.open)c.send(m);}catch(e){}}
 function broadcast(){
   G.players.forEach((p,i)=>{
     const v=viewFor(i);
-    if(i===0)onView(v);else safeSend(conns[p.id],{t:'view',v});
+    if(i===0)onView(v);else pub(topic('dn/'+p.id),{t:'view',v});
   });
   try{localStorage.setItem('cabo_host',JSON.stringify({code:roomCode,G}));}catch(e){}
 }
-function sendPrivate(i,m){if(i===0)onMsg(m);else safeSend(conns[G.players[i].id],m);}
+function sendPrivate(i,m){if(i===0)onMsg(m);else pub(topic('dn/'+G.players[i].id),m);}
 
-function hostMsg(c,m){
-  if(!m||typeof m!=='object')return;
+function hostMsg(m){
+  if(!m||typeof m!=='object'||typeof m.token!=='string')return;
+  const seen=dedup[m.token]=dedup[m.token]||[];
+  if(m.mid){if(seen.includes(m.mid))return;seen.push(m.mid);if(seen.length>80)seen.shift();}
+  if(m.t==='gone'){
+    const i=G.players.findIndex(x=>x.id===m.token);if(i<0)return;
+    if(G.phase==='lobby'&&i>0){log(G.players[i].name+' hat den Raum verlassen.');dbg(G.players[i].name+' hat den Raum verlassen');G.players.splice(i,1);}
+    else if(i>0)G.players[i].connected=false;
+    broadcast();return;
+  }
   if(m.t==='join'){
-    let p=G.players.find(x=>x.id===m.token);
+    let p=G.players.find(x=>x.id===m.token),fresh=false;
     if(p){p.connected=true;if(G.phase==='lobby'&&m.name)p.name=String(m.name).slice(0,16);}
     else if(G.phase==='lobby'&&G.players.length<4){
-      p=newPlayer(m.token,String(m.name||'Spieler').slice(0,16));G.players.push(p);log(p.name+' ist beigetreten.');
-    }else{safeSend(c,{t:'error',msg:G.phase==='lobby'?'Der Raum ist voll (max. 4 Spieler).':'Das Spiel läuft bereits.'});return;}
-    c.pid=m.token;conns[m.token]=c;dbg(p.name+' ist beigetreten');broadcast();return;
+      p=newPlayer(m.token,String(m.name||'Spieler').slice(0,16));G.players.push(p);log(p.name+' ist beigetreten.');fresh=true;
+    }else{pub(topic('dn/'+m.token),{t:'error',msg:G.phase==='lobby'?'Der Raum ist voll (max. 4 Spieler).':'Das Spiel läuft bereits.'});return;}
+    if(fresh)dbg(p.name+' ist beigetreten');
+    broadcast();return;
   }
-  if(!c.pid)return;
-  const i=G.players.findIndex(x=>x.id===c.pid);
-  if(i>=0)act(i,m);
+  const i=G.players.findIndex(x=>x.id===m.token);
+  if(i>0){if(!G.players[i].connected){G.players[i].connected=true;}act(i,m);}
 }
-function hostClosed(c){
-  if(!c.pid||conns[c.pid]!==c)return;
-  delete conns[c.pid];
-  const i=G.players.findIndex(x=>x.id===c.pid);if(i<0)return;
-  if(G.phase==='lobby'&&i>0){log(G.players[i].name+' hat den Raum verlassen.');G.players.splice(i,1);}
-  else G.players[i].connected=false;
-  broadcast();
-}
-function openHostPeer(){
+function openHost(){
   status='Verbinde mit Server …';render();
-  if(peer)try{peer.destroy();}catch(e){}
-  peer=new Peer('cabo-'+roomCode,PEER_OPTS);dbg('Verbinde mit Vermittlungsserver …');
-  peer.on('open',id=>{status='';dbg('Raum online ('+id+')');broadcast();});
-  peer.on('connection',c=>{dbg('Verbindungsanfrage von einem Mitspieler');c.on('open',()=>dbg('Datenkanal zum Mitspieler offen'));c.on('data',m=>hostMsg(c,m));c.on('close',()=>hostClosed(c));c.on('error',()=>{});});
-  peer.on('disconnected',()=>{try{peer.reconnect();}catch(e){}});
-  peer.on('error',e=>{
-    dbg('Fehler: '+e.type);
-    if(e.type==='unavailable-id'){status='Raumcode noch belegt, neuer Versuch …';render();clearTimeout(retryT);retryT=setTimeout(openHostPeer,3000);}
-    else if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'||e.type==='socket-closed'){status='Netzwerkproblem: '+e.type;render();}
-    else{status='Fehler: '+e.type;render();}
+  dbg('Verbinde mit Server '+(brokerIdx(roomCode)+1)+' …');
+  const c=mqOpen({topic:topic('host'),payload:JSON.stringify({online:false}),qos:1,retain:true});
+  if(!c)return;
+  c.on('connect',()=>{
+    status='';dbg('Raum online ('+roomCode+')');
+    c.subscribe(topic('up'),{qos:1},()=>{
+      pub(topic('host'),{online:true,t:Date.now()},true);
+      broadcast();
+    });
   });
+  c.on('message',(tp,pl)=>{
+    if(tp!==topic('up'))return;
+    let m;try{m=JSON.parse(pl.toString());}catch(e){return;}
+    hostMsg(m);
+  });
+  /* Server nicht erreichbar (nur solange noch niemand beigetreten ist): nächsten Server probieren */
+  setTimeout(()=>{
+    if(mq!==c||c.connected||!G||G.phase!=='lobby'||G.players.length>1)return;
+    const next=(brokerIdx(roomCode)+1)%BROKERS.length;
+    roomCode='ABC'[next]+roomCode.slice(1);
+    dbg('Server antwortet nicht – wechsle zu Server '+(next+1)+' (neuer Raumcode '+roomCode+')');
+    openHost();
+  },12000);
 }
 function startHost(name){
   role='host';myName=name;roomCode=makeCode();G=freshG();
   G.players.push(newPlayer(token,name));
   S.setItem('cabo_session',JSON.stringify({role:'host'}));
-  onView(viewFor(0));openHostPeer();
+  onView(viewFor(0));openHost();
 }
 function resumeHost(){
   let o;try{o=JSON.parse(localStorage.getItem('cabo_host')||'null');}catch(e){}
@@ -356,7 +380,7 @@ function resumeHost(){
   G=o.G;roomCode=o.code;role='host';token=G.players[0].id;S.setItem('cabo_token',token);
   myName=G.players[0].name;G.players.forEach((p,i)=>p.connected=i===0);
   S.setItem('cabo_session',JSON.stringify({role:'host'}));
-  onView(viewFor(0));openHostPeer();return true;
+  onView(viewFor(0));openHost();return true;
 }
 
 /* ------------------------------ CLIENT ------------------------------ */
@@ -365,32 +389,36 @@ function startClient(name,code){
   S.setItem('cabo_session',JSON.stringify({role:'client',name,code}));
   connectClient();
 }
-function retry(ms){clearTimeout(retryT);retryT=setTimeout(connectClient,ms);}
+function sendJoin(){pub(topic('up'),{t:'join',name:myName,token,mid:sess+':'+(++mseq)});}
 function connectClient(){
   if(fatal)return;
   status='Verbinde …';render();
-  if(peer)try{peer.destroy();}catch(e){}
-  peer=new Peer(undefined,PEER_OPTS);dbg('Verbinde mit Vermittlungsserver …');
-  peer.on('open',()=>{
-    dbg('Server verbunden, suche Host …');
-    const c=conn=peer.connect('cabo-'+roomCode,{reliable:true,serialization:'json'});
-    let alive=false,first=true;
-    const to=setTimeout(()=>{if(conn!==c||alive||fatal)return;dbg('Keine Verbindung zum Host nach 15 s');status='Host nicht erreichbar – ist das Spiel offen? Neuer Versuch …';render();retry(1000);},15000);
-    c.on('open',()=>{alive=true;clearTimeout(to);status='';dbg('Datenkanal offen, sende Beitritt');c.send({t:'join',name:myName,token});render();});
-    c.on('data',m=>{if(first){first=false;dbg('Antwort vom Host erhalten');}onMsg(m);});
-    conn.on('close',()=>{if(fatal)return;status='Verbindung verloren – verbinde neu …';render();retry(2500);});
-    conn.on('error',()=>{});
+  dbg('Verbinde mit Server '+(brokerIdx(roomCode)+1)+' …');
+  const c=mqOpen({topic:topic('up'),payload:JSON.stringify({t:'gone',token}),qos:1});
+  if(!c)return;
+  let hostSeen=false;
+  c.on('connect',()=>{
+    dbg('Server verbunden, suche Raum '+roomCode+' …');
+    c.subscribe([topic('dn/'+token),topic('host')],{qos:1},()=>{
+      sendJoin();
+      setTimeout(()=>{if(mq===c&&!hostSeen&&!fatal){status='Raum nicht gefunden – Code prüfen. Läuft das Spiel beim Host noch (Tab offen)?';dbg('Kein Host für diesen Code gefunden');render();}},8000);
+    });
   });
-  peer.on('error',e=>{
-    dbg('Fehler: '+e.type);
-    if(fatal)return;
-    status=e.type==='peer-unavailable'?'Raum nicht gefunden – Code prüfen und sicherstellen, dass der Host online ist. Neuer Versuch …':'Verbindungsfehler ('+e.type+') – neuer Versuch …';
-    render();retry(4000);
+  c.on('message',(tp,pl)=>{
+    let m;try{m=JSON.parse(pl.toString());}catch(e){return;}
+    if(tp===topic('host')){
+      if(m&&m.online){hostSeen=true;dbg('Host ist online');sendJoin();}
+      else if(m&&m.online===false){status='Der Host ist gerade offline …';dbg('Host offline');render();}
+      return;
+    }
+    if(!hostSeen){hostSeen=true;}
+    if(status){status='';}
+    onMsg(m);
   });
 }
 function send(m){
   if(role==='host')act(0,m);
-  else if(conn&&conn.open)conn.send(m);
+  else if(mq&&mq.connected)pub(topic('up'),{...m,token,mid:sess+':'+(++mseq)});
   else toast('Keine Verbindung …');
 }
 function onMsg(m){
@@ -398,8 +426,7 @@ function onMsg(m){
   if(m.t==='view')onView(m.v);
   else if(m.t==='peek')addTemp(m.owner,m.slot,m.v,m.ms||4000);
   else if(m.t==='error'){
-    fatal=true;S.removeItem('cabo_session');
-    if(conn)try{conn.close();}catch(e){}
+    fatal=true;S.removeItem('cabo_session');closeMq();
     view=null;role=null;status=m.msg;render();
   }
 }
@@ -421,8 +448,16 @@ function onView(v){
 function toast(t){ui.toast=t;render();clearTimeout(tt);tt=setTimeout(()=>{ui.toast='';render();},2800);}
 function leave(){
   S.removeItem('cabo_session');
-  if(role==='host')try{localStorage.removeItem('cabo_host');}catch(e){}
-  location.href=location.href.split('?')[0];
+  let done=false;
+  const go=()=>{if(done)return;done=true;if(role==='host')try{localStorage.removeItem('cabo_host');}catch(e){}closeMq();location.href=location.href.split('?')[0];};
+  try{
+    if(mq&&mq.connected){
+      if(role==='client')mq.publish(topic('up'),JSON.stringify({t:'gone',token}),{qos:1},go);
+      else if(role==='host')mq.publish(topic('host'),JSON.stringify({online:false}),{qos:1,retain:true},go);
+      setTimeout(go,700);return;
+    }
+  }catch(e){}
+  go();
 }
 
 /* ------------------------------ Darstellung ------------------------------ */
@@ -433,7 +468,7 @@ function menuHTML(){
   <label>Dein Name</label><input id="name" maxlength="16" value="${esc(localStorage.getItem('cabo_name')||'')}" autocomplete="off" placeholder="z. B. Mama">
   <button class="big" data-a="create">Neues Spiel erstellen</button>
   <div class="or">— oder —</div>
-  <label>Raumcode</label><input id="code" maxlength="5" value="${esc(q)}" style="text-transform:uppercase" autocomplete="off" placeholder="5 Buchstaben">
+  <label>Raumcode</label><input id="code" maxlength="6" value="${esc(q)}" style="text-transform:uppercase" autocomplete="off" placeholder="6 Buchstaben">
   <button class="big sec" data-a="join">Beitreten</button>
   ${hasSaved?'<button class="big sec" data-a="resume">Laufendes Spiel als Host fortsetzen</button>':''}
   <p class="note">${esc(status)}</p>
@@ -568,7 +603,7 @@ $app.addEventListener('click',e=>{
       const name=(document.getElementById('name').value||'').trim();
       const code=(document.getElementById('code').value||'').trim().toUpperCase();
       if(!name)return toast('Bitte gib deinen Namen ein.');
-      if(code.length<4)return toast('Bitte gib den Raumcode ein.');
+      if(code.length<6)return toast('Bitte gib den kompletten Raumcode (6 Buchstaben) ein.');
       localStorage.setItem('cabo_name',name);startClient(name,code);break;}
     case 'resume':resumeHost();break;
     case 'leave':leave();break;
