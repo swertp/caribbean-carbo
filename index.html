@@ -102,7 +102,7 @@ function makeCode(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ';let s='A';for(let i=0;i<5
 function makeToken(){return 'p'+Math.random().toString(36).slice(2,10)+Date.now().toString(36);}
 
 let token=S.getItem('cabo_token'); if(!token){token=makeToken();S.setItem('cabo_token',token);}
-let role=null,myName='',roomCode='',mq=null,G=null,view=null,status='',fatal=false,retryT=null,tt=null,tc=0,dedup={},sess=Math.random().toString(36).slice(2,8),mseq=0;
+let role=null,myName='',roomCode='',mq=null,G=null,view=null,status='',fatal=false,retryT=null,tt=null,tc=0,authed=false,KEY=null,TAG='',rxQ=Promise.resolve(),txQ=Promise.resolve(),mqGen=0,dedup={},sess=Math.random().toString(36).slice(2,8),mseq=0;
 let ui={sel:[],swapOwn:null,peeked:[],temps:{},round:-1,lastFlash:0,toast:''};
 const dbgLog=[];
 function dbg(m){dbgLog.push(new Date().toTimeString().slice(0,8)+' '+m);if(dbgLog.length>8)dbgLog.shift();try{render();}catch(e){}}
@@ -110,10 +110,55 @@ function dbgHTML(){return dbgLog.length?'<div class="dbg">'+dbgLog.map(esc).join
 /* Öffentliche MQTT-Broker (Websocket/TLS). Der erste Buchstabe des Raumcodes wählt den Broker: A, B, C. */
 const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081'];
 const brokerIdx=code=>{const k='ABC'.indexOf((code||'A')[0]);return k>=0?k:0;};
-const topic=(suffix)=>'cabo-fam/v1/'+roomCode+'/'+suffix;
-function mqOpen(will){
+const topic=(suffix)=>'cabo-fam/v2/'+TAG+'/'+roomCode+'/'+suffix;
+/* ---------- Passwortschutz: Passwort -> Prüfwert, Raum-Kennung und AES-Schlüssel (nur im Browser) ----------
+   Ohne das Passwort kann niemand den Raum finden, mitlesen oder Nachrichten einschleusen.
+   Passwort ändern: neuen PW_CHECK berechnen mit
+   python3 -c "import hashlib;print(hashlib.pbkdf2_hmac('sha256',b'NEUESPASSWORT',b'cabo-fam-check-v1',150000,32).hex())" */
+const PW_CHECK='1d69d334158f88b3caaa28633fc67aae51191739836e2ee13761dfca130932eb';
+const hex=u=>[...u].map(b=>b.toString(16).padStart(2,'0')).join('');
+async function pbk(pw,salt,iter,bits){
+  const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:new TextEncoder().encode(salt),iterations:iter},km,bits));
+}
+async function unlock(pw){
+  try{
+    if(hex(await pbk(pw,'cabo-fam-check-v1',150000,256))!==PW_CHECK)return false;
+    TAG=hex(await pbk(pw,'cabo-fam-topic-v1',50000,48));
+    KEY=await crypto.subtle.importKey('raw',await pbk(pw,'cabo-fam-key-v1',150000,256),'AES-GCM',false,['encrypt','decrypt']);
+    authed=true;S.setItem('cabo_pw',pw);return true;
+  }catch(e){return false;}
+}
+const b64=u=>{let t='';u.forEach(b=>t+=String.fromCharCode(b));return btoa(t);};
+const unb64=t=>Uint8Array.from(atob(t),c=>c.charCodeAt(0));
+async function enc(obj){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},KEY,new TextEncoder().encode(JSON.stringify(obj))));
+  const out=new Uint8Array(12+ct.length);out.set(iv);out.set(ct,12);return b64(out);
+}
+async function dec(pl){
+  try{
+    const t=pl.toString();if(!t)return null;
+    const u=unb64(t);
+    return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:u.slice(0,12)},KEY,u.slice(12))));
+  }catch(e){return null;}
+}
+/* eingehend/ausgehend in Reihenfolge abarbeiten; nicht entschlüsselbare Nachrichten werden ignoriert */
+function onRaw(pl,fn){rxQ=rxQ.then(async()=>{const m=await dec(pl);if(m)fn(m);}).catch(()=>{});}
+function pubP(t,obj,retain){
+  const p=txQ.then(async()=>{
+    const payload=await enc(obj);
+    if(!(mq&&mq.connected))return;
+    await new Promise(r=>{try{mq.publish(t,payload,{qos:1,retain:!!retain},()=>r());}catch(e){r();}setTimeout(r,800);});
+  });
+  txQ=p.catch(()=>{});return p.catch(()=>{});
+}
+function pub(t,obj,retain){pubP(t,obj,retain);}
+async function mqOpen(ws){
   if(typeof mqtt==='undefined'){dbg('FEHLER: MQTT-Bibliothek konnte nicht geladen werden (Internet/Werbeblocker?)');status='MQTT-Bibliothek nicht geladen';render();return null;}
-  closeMq();
+  closeMq();const gen=mqGen;
+  const will={topic:ws.topic,payload:await enc(ws.obj),qos:1,retain:!!ws.retain};
+  if(gen!==mqGen)return null;
   const c=mqtt.connect(BROKERS[brokerIdx(roomCode)],{clientId:'cabo_'+Math.random().toString(16).slice(2,12),clean:true,reconnectPeriod:2000,connectTimeout:10000,keepalive:30,will});
   mq=c;
   c.on('error',e=>dbg('Fehler: '+(e&&e.message||e)));
@@ -121,8 +166,7 @@ function mqOpen(will){
   c.on('close',()=>{if(mq===c&&!fatal){status='Verbindung zum Server getrennt – verbinde neu …';render();}});
   return c;
 }
-function closeMq(){if(mq){const c=mq;mq=null;try{c.removeAllListeners();c.on('error',()=>{});c.end(true);}catch(e){}}}
-function pub(t,obj,retain){if(mq&&mq.connected)try{mq.publish(t,typeof obj==='string'?obj:JSON.stringify(obj),{qos:1,retain:!!retain});}catch(e){}}
+function closeMq(){mqGen++;if(mq){const c=mq;mq=null;try{c.removeAllListeners();c.on('error',()=>{});c.end(true);}catch(e){}}}
 const numColor=v=>`hsl(${172-v*12},72%,${v>9?42:30}%)`;
 const ICON={7:'👁',8:'👁',9:'🔍',10:'🔍',11:'🔄',12:'🔄'};
 const ACT={7:'peek',8:'peek',9:'spy',10:'spy',11:'swap',12:'swap'};
@@ -342,10 +386,10 @@ function hostMsg(m){
   const i=G.players.findIndex(x=>x.id===m.token);
   if(i>0){if(!G.players[i].connected){G.players[i].connected=true;}act(i,m);}
 }
-function openHost(){
+async function openHost(){
   status='Verbinde mit Server …';render();
   dbg('Verbinde mit Server '+(brokerIdx(roomCode)+1)+' …');
-  const c=mqOpen({topic:topic('host'),payload:JSON.stringify({online:false}),qos:1,retain:true});
+  const c=await mqOpen({topic:topic('host'),obj:{online:false},retain:true});
   if(!c)return;
   c.on('connect',()=>{
     status='';dbg('Raum online ('+roomCode+')');
@@ -354,11 +398,7 @@ function openHost(){
       broadcast();
     });
   });
-  c.on('message',(tp,pl)=>{
-    if(tp!==topic('up'))return;
-    let m;try{m=JSON.parse(pl.toString());}catch(e){return;}
-    hostMsg(m);
-  });
+  c.on('message',(tp,pl)=>onRaw(pl,m=>{if(tp===topic('up'))hostMsg(m);}));
   /* Server nicht erreichbar (nur solange noch niemand beigetreten ist): nächsten Server probieren */
   setTimeout(()=>{
     if(mq!==c||c.connected||!G||G.phase!=='lobby'||G.players.length>1)return;
@@ -390,11 +430,11 @@ function startClient(name,code){
   connectClient();
 }
 function sendJoin(){pub(topic('up'),{t:'join',name:myName,token,mid:sess+':'+(++mseq)});}
-function connectClient(){
+async function connectClient(){
   if(fatal)return;
   status='Verbinde …';render();
   dbg('Verbinde mit Server '+(brokerIdx(roomCode)+1)+' …');
-  const c=mqOpen({topic:topic('up'),payload:JSON.stringify({t:'gone',token}),qos:1});
+  const c=await mqOpen({topic:topic('up'),obj:{t:'gone',token}});
   if(!c)return;
   let hostSeen=false;
   c.on('connect',()=>{
@@ -404,8 +444,7 @@ function connectClient(){
       setTimeout(()=>{if(mq===c&&!hostSeen&&!fatal){status='Raum nicht gefunden – Code prüfen. Läuft das Spiel beim Host noch (Tab offen)?';dbg('Kein Host für diesen Code gefunden');render();}},8000);
     });
   });
-  c.on('message',(tp,pl)=>{
-    let m;try{m=JSON.parse(pl.toString());}catch(e){return;}
+  c.on('message',(tp,pl)=>onRaw(pl,m=>{
     if(tp===topic('host')){
       if(m&&m.online){hostSeen=true;dbg('Host ist online');sendJoin();}
       else if(m&&m.online===false){status='Der Host ist gerade offline …';dbg('Host offline');render();}
@@ -414,7 +453,7 @@ function connectClient(){
     if(!hostSeen){hostSeen=true;}
     if(status){status='';}
     onMsg(m);
-  });
+  }));
 }
 function send(m){
   if(role==='host')act(0,m);
@@ -452,15 +491,20 @@ function leave(){
   const go=()=>{if(done)return;done=true;if(role==='host')try{localStorage.removeItem('cabo_host');}catch(e){}closeMq();location.href=location.href.split('?')[0];};
   try{
     if(mq&&mq.connected){
-      if(role==='client')mq.publish(topic('up'),JSON.stringify({t:'gone',token}),{qos:1},go);
-      else if(role==='host')mq.publish(topic('host'),JSON.stringify({online:false}),{qos:1,retain:true},go);
-      setTimeout(go,700);return;
+      if(role==='client')pubP(topic('up'),{t:'gone',token}).then(go);
+      else if(role==='host')pubP(topic('host'),{online:false},true).then(go);
+      setTimeout(go,1200);return;
     }
   }catch(e){}
   go();
 }
 
 /* ------------------------------ Darstellung ------------------------------ */
+function loginHTML(){
+  return `<div class="menu"><h1>🌴 CABO 🌴</h1><p class="sub">Familienspiel – bitte Passwort eingeben</p>
+  <label>Passwort</label><input id="pw" type="password" autocomplete="current-password" placeholder="Passwort">
+  <button class="big" data-a="login">Weiter</button></div>`;
+}
 function menuHTML(){
   const q=new URLSearchParams(location.search).get('raum')||'';
   let hasSaved=false;try{hasSaved=!!localStorage.getItem('cabo_host');}catch(e){}
@@ -578,7 +622,8 @@ function gameHTML(v){
 }
 function render(){
   let html;
-  if(!view){
+  if(!authed)html=loginHTML();
+  else if(!view){
     html=role?`<div class="center"><h2>${esc(status||'Verbinde …')}</h2>${dbgHTML()}<button class="sec" data-a="leave">Abbrechen</button></div>`
       :menuHTML();
     if(!role&&status&&!document.getElementById('name')){/* Fehlermeldung nach Abbruch anzeigen */}
@@ -605,6 +650,7 @@ $app.addEventListener('click',e=>{
       if(!name)return toast('Bitte gib deinen Namen ein.');
       if(code.length<6)return toast('Bitte gib den kompletten Raumcode (6 Buchstaben) ein.');
       localStorage.setItem('cabo_name',name);startClient(name,code);break;}
+    case 'login':doLogin();break;
     case 'resume':resumeHost();break;
     case 'leave':leave();break;
     case 'start':send({t:'start'});break;
@@ -643,11 +689,24 @@ $app.addEventListener('click',e=>{
 });
 
 /* ------------------------------ Start ------------------------------ */
-(function boot(){
+function resumeSession(){
   let s=null;try{s=JSON.parse(S.getItem('cabo_session')||'null');}catch(e){}
   if(s&&s.role==='client'&&s.code)startClient(s.name||'Spieler',s.code);
-  else if(s&&s.role==='host'&&resumeHost()){}
-  else render();
+  else if(s&&s.role==='host')resumeHost();
+}
+async function doLogin(){
+  const v=(document.getElementById('pw')||{}).value||'';
+  if(!v)return toast('Bitte Passwort eingeben.');
+  if(!(globalThis.crypto&&crypto.subtle))return toast('Bitte die Seite über https:// öffnen.');
+  const ok=await unlock(v);
+  if(!ok)return toast('Falsches Passwort.');
+  resumeSession();render();
+}
+$app.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target&&e.target.id==='pw')doLogin();});
+(async function boot(){
+  const pw=S.getItem('cabo_pw');
+  if(pw&&globalThis.crypto&&crypto.subtle){if(await unlock(pw))resumeSession();else S.removeItem('cabo_pw');}
+  render();
 })();
 </script>
 </body>
