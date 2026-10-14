@@ -79,6 +79,7 @@ tr.win td{color:var(--sun);font-weight:700}
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--coral);padding:10px 18px;border-radius:99px;z-index:9;font-weight:700;box-shadow:0 4px 12px rgba(0,0,0,.35)}
 .res{background:rgba(3,58,82,.6);border-radius:16px;padding:12px;margin-top:14px;border:2px solid rgba(255,243,214,.4)}
 .res .cards{font-size:.8rem}
+.dbg{font-size:.7rem;opacity:.7;margin:8px 0;font-family:monospace;text-align:left}
 </style>
 </head>
 <body>
@@ -102,6 +103,13 @@ function makeToken(){return 'p'+Math.random().toString(36).slice(2,10)+Date.now(
 let token=S.getItem('cabo_token'); if(!token){token=makeToken();S.setItem('cabo_token',token);}
 let role=null,myName='',roomCode='',peer=null,conn=null,conns={},G=null,view=null,status='',fatal=false,retryT=null,tt=null,tc=0;
 let ui={sel:[],swapOwn:null,peeked:[],temps:{},round:-1,lastFlash:0,toast:''};
+const dbgLog=[];
+function dbg(m){dbgLog.push(new Date().toTimeString().slice(0,8)+' '+m);if(dbgLog.length>8)dbgLog.shift();try{render();}catch(e){}}
+function dbgHTML(){return dbgLog.length?'<div class="dbg">'+dbgLog.map(esc).join('<br>')+'</div>':'';}
+const PEER_OPTS={config:{iceServers:[
+  {urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'},
+  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}
+]}};
 const numColor=v=>`hsl(${172-v*12},72%,${v>9?42:30}%)`;
 const ICON={7:'👁',8:'👁',9:'🔍',10:'🔍',11:'🔄',12:'🔄'};
 const ACT={7:'peek',8:'peek',9:'spy',10:'spy',11:'swap',12:'swap'};
@@ -308,7 +316,7 @@ function hostMsg(c,m){
     else if(G.phase==='lobby'&&G.players.length<4){
       p=newPlayer(m.token,String(m.name||'Spieler').slice(0,16));G.players.push(p);log(p.name+' ist beigetreten.');
     }else{safeSend(c,{t:'error',msg:G.phase==='lobby'?'Der Raum ist voll (max. 4 Spieler).':'Das Spiel läuft bereits.'});return;}
-    c.pid=m.token;conns[m.token]=c;broadcast();return;
+    c.pid=m.token;conns[m.token]=c;dbg(p.name+' ist beigetreten');broadcast();return;
   }
   if(!c.pid)return;
   const i=G.players.findIndex(x=>x.id===c.pid);
@@ -325,11 +333,12 @@ function hostClosed(c){
 function openHostPeer(){
   status='Verbinde mit Server …';render();
   if(peer)try{peer.destroy();}catch(e){}
-  peer=new Peer('cabo-'+roomCode);
-  peer.on('open',()=>{status='';broadcast();});
-  peer.on('connection',c=>{c.on('data',m=>hostMsg(c,m));c.on('close',()=>hostClosed(c));c.on('error',()=>{});});
+  peer=new Peer('cabo-'+roomCode,PEER_OPTS);dbg('Verbinde mit Vermittlungsserver …');
+  peer.on('open',id=>{status='';dbg('Raum online ('+id+')');broadcast();});
+  peer.on('connection',c=>{dbg('Verbindungsanfrage von einem Mitspieler');c.on('open',()=>dbg('Datenkanal zum Mitspieler offen'));c.on('data',m=>hostMsg(c,m));c.on('close',()=>hostClosed(c));c.on('error',()=>{});});
   peer.on('disconnected',()=>{try{peer.reconnect();}catch(e){}});
   peer.on('error',e=>{
+    dbg('Fehler: '+e.type);
     if(e.type==='unavailable-id'){status='Raumcode noch belegt, neuer Versuch …';render();clearTimeout(retryT);retryT=setTimeout(openHostPeer,3000);}
     else if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'||e.type==='socket-closed'){status='Netzwerkproblem: '+e.type;render();}
     else{status='Fehler: '+e.type;render();}
@@ -361,15 +370,19 @@ function connectClient(){
   if(fatal)return;
   status='Verbinde …';render();
   if(peer)try{peer.destroy();}catch(e){}
-  peer=new Peer();
+  peer=new Peer(undefined,PEER_OPTS);dbg('Verbinde mit Vermittlungsserver …');
   peer.on('open',()=>{
-    conn=peer.connect('cabo-'+roomCode,{reliable:true});
-    conn.on('open',()=>{status='';conn.send({t:'join',name:myName,token});render();});
-    conn.on('data',onMsg);
+    dbg('Server verbunden, suche Host …');
+    const c=conn=peer.connect('cabo-'+roomCode,{reliable:true,serialization:'json'});
+    let alive=false,first=true;
+    const to=setTimeout(()=>{if(conn!==c||alive||fatal)return;dbg('Keine Verbindung zum Host nach 15 s');status='Host nicht erreichbar – ist das Spiel offen? Neuer Versuch …';render();retry(1000);},15000);
+    c.on('open',()=>{alive=true;clearTimeout(to);status='';dbg('Datenkanal offen, sende Beitritt');c.send({t:'join',name:myName,token});render();});
+    c.on('data',m=>{if(first){first=false;dbg('Antwort vom Host erhalten');}onMsg(m);});
     conn.on('close',()=>{if(fatal)return;status='Verbindung verloren – verbinde neu …';render();retry(2500);});
     conn.on('error',()=>{});
   });
   peer.on('error',e=>{
+    dbg('Fehler: '+e.type);
     if(fatal)return;
     status=e.type==='peer-unavailable'?'Raum nicht gefunden – Code prüfen und sicherstellen, dass der Host online ist. Neuer Versuch …':'Verbindungsfehler ('+e.type+') – neuer Versuch …';
     render();retry(4000);
@@ -439,7 +452,7 @@ function lobbyHTML(v){
   ${host?`<button class="big" data-a="start" ${v.players.length<2?'disabled':''}>Spiel starten (${v.players.length}/4)</button>
   <p class="note">${v.players.length<2?'Warte auf mindestens einen Mitspieler …':'Es können noch bis zu 4 Personen beitreten.'}</p>`
   :`<p class="note" style="text-align:center">Warte, bis ${esc(v.players[0].name)} das Spiel startet …</p>`}
-  <p class="note">${esc(status)}</p>
+  <p class="note">${esc(status)}</p>${dbgHTML()}
   <button class="small" data-a="leave">Verlassen</button></div>`;
 }
 function cardHTML(c,owner,slot,o={}){
@@ -531,7 +544,7 @@ function gameHTML(v){
 function render(){
   let html;
   if(!view){
-    html=role?`<div class="center"><h2>${esc(status||'Verbinde …')}</h2><button class="sec" data-a="leave">Abbrechen</button></div>`
+    html=role?`<div class="center"><h2>${esc(status||'Verbinde …')}</h2>${dbgHTML()}<button class="sec" data-a="leave">Abbrechen</button></div>`
       :menuHTML();
     if(!role&&status&&!document.getElementById('name')){/* Fehlermeldung nach Abbruch anzeigen */}
   }else html=view.phase==='lobby'?lobbyHTML(view):gameHTML(view);
